@@ -1,3 +1,6 @@
+//go:build deepseek
+// +build deepseek
+
 package main
 
 import (
@@ -5,7 +8,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -107,11 +109,51 @@ type ChatRequest struct {
 }
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content,omitempty"`
+	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Name       string          `json:"name,omitempty"`
+}
+
+// ContentPart represents a part of multimodal content
+type ContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// GetContentString extracts text content from Message.Content
+// It handles both string and array formats
+func (m *Message) GetContentString() string {
+	if m.Content == nil {
+		return ""
+	}
+
+	// Try to unmarshal as string first
+	var strContent string
+	if err := json.Unmarshal(m.Content, &strContent); err == nil {
+		return strContent
+	}
+
+	// Try to unmarshal as array of content parts
+	var parts []ContentPart
+	if err := json.Unmarshal(m.Content, &parts); err == nil {
+		var textParts []string
+		for _, part := range parts {
+			if part.Type == "text" && part.Text != "" {
+				textParts = append(textParts, part.Text)
+			}
+		}
+		return strings.Join(textParts, "\n")
+	}
+
+	return ""
+}
+
+// SetContentString sets the content as a string
+func (m *Message) SetContentString(content string) {
+	data, _ := json.Marshal(content)
+	m.Content = data
 }
 
 type Function struct {
@@ -163,6 +205,11 @@ func convertMessages(messages []Message) []Message {
 		log.Printf("Converting message %d - Role: %s", i, msg.Role)
 		converted[i] = msg
 
+		// Convert array-format content to string format for DeepSeek
+		// DeepSeek only supports string content, not multimodal arrays
+		contentStr := msg.GetContentString()
+		converted[i].SetContentString(contentStr)
+
 		// Handle assistant messages with tool calls
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
 			log.Printf("Processing assistant message with %d tool calls", len(msg.ToolCalls))
@@ -189,7 +236,7 @@ func convertMessages(messages []Message) []Message {
 
 	// Log the final converted messages
 	for i, msg := range converted {
-		log.Printf("Final message %d - Role: %s, Content: %s", i, msg.Role, truncateString(msg.Content, 50))
+		log.Printf("Final message %d - Role: %s, Content: %s", i, msg.Role, truncateString(msg.GetContentString(), 50))
 		if len(msg.ToolCalls) > 0 {
 			log.Printf("Message %d has %d tool calls", i, len(msg.ToolCalls))
 		}
@@ -296,14 +343,21 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Parsed request: %+v", chatReq)
 
 	// Handle models endpoint
-	if r.URL.Path == "/v1/models" {
+	if r.URL.Path == "/v1/models" || r.URL.Path == "/models" {
 		handleModelsRequest(w)
 		return
 	}
 
-	// Only handle API requests with /v1/ prefix
-	if !strings.HasPrefix(r.URL.Path, "/v1/") {
-		log.Printf("Invalid path: %s", r.URL.Path)
+	// Normalize path - support both /v1/chat/completions and /chat/completions
+	requestPath := r.URL.Path
+	if !strings.HasPrefix(requestPath, "/v1/") {
+		// Add /v1/ prefix if not present
+		requestPath = "/v1" + requestPath
+	}
+
+	// Only handle chat completions
+	if requestPath != "/v1/chat/completions" {
+		log.Printf("Invalid path: %s (normalized: %s)", r.URL.Path, requestPath)
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
@@ -375,7 +429,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("========== Request to DeepSeek ==========")
 	log.Printf("Modified request body: %s", string(modifiedBody))
+	log.Printf("==========================================")
 
 	// Create the proxy request to DeepSeek
 	targetURL := activeConfig.endpoint + r.URL.Path
@@ -426,8 +482,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	log.Printf("DeepSeek response status: %d", resp.StatusCode)
-	log.Printf("DeepSeek response headers: %v", resp.Header)
+	log.Printf("========== DeepSeek Response ==========")
+	log.Printf("Status: %d", resp.StatusCode)
+	log.Printf("Headers: %v", resp.Header)
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {
@@ -437,7 +494,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Error reading response", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("DeepSeek error response: %s", string(respBody))
+		log.Printf("========== DeepSeek ERROR Response Body ==========")
+		log.Printf("%s", string(respBody))
+		log.Printf("===================================================")
 
 		// Forward the error response
 		for k, v := range resp.Header {
@@ -473,68 +532,77 @@ func handleStreamingResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	// Create a buffered reader for the response body
 	reader := bufio.NewReader(resp.Body)
 
-	// Create a context with cancel for cleanup
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	// Start a goroutine to send heartbeats
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Send a heartbeat comment
-				if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
-					log.Printf("Error sending heartbeat: %v", err)
-					cancel()
-					return
-				}
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("Warning: ResponseWriter does not support Flush")
+	}
 
 	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Context cancelled, ending stream")
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("Error reading stream: %v", err)
 			return
-		default:
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err == io.EOF {
-					continue
+		}
+
+		lineStr := string(line)
+
+		// Skip empty lines but forward them for SSE format
+		if len(strings.TrimSpace(lineStr)) == 0 {
+			w.Write(line)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			continue
+		}
+
+		// Handle SSE data lines
+		if strings.HasPrefix(lineStr, "data: ") {
+			data := strings.TrimPrefix(lineStr, "data: ")
+			data = strings.TrimSpace(data)
+
+			// Handle [DONE] marker
+			if data == "[DONE]" {
+				w.Write([]byte("data: [DONE]\n\n"))
+				if flusher != nil {
+					flusher.Flush()
 				}
-				log.Printf("Error reading stream: %v", err)
-				cancel()
-				return
+				break
 			}
 
-			// Skip empty lines
-			if len(bytes.TrimSpace(line)) == 0 {
-				continue
-			}
+			// Parse and modify the JSON to replace model name
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(data), &chunk); err == nil {
+				// Replace model name with original requested model
+				chunk["model"] = originalModel
 
-			// Write the line to the response
-			if _, err := w.Write(line); err != nil {
-				log.Printf("Error writing to response: %v", err)
-				cancel()
-				return
-			}
-
-			// Flush the response writer
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+				// Re-serialize
+				modifiedData, err := json.Marshal(chunk)
+				if err == nil {
+					w.Write([]byte("data: "))
+					w.Write(modifiedData)
+					w.Write([]byte("\n\n"))
+				} else {
+					// If re-serialization fails, forward original
+					w.Write(line)
+				}
 			} else {
-				log.Printf("Warning: ResponseWriter does not support Flush")
+				// If parsing fails, forward original line
+				w.Write(line)
 			}
+		} else {
+			// Forward non-data lines as-is (comments, etc.)
+			w.Write(line)
+		}
+
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
+
+	log.Printf("Streaming response completed")
 }
 
 func handleRegularResponse(w http.ResponseWriter, resp *http.Response, originalModel string) {
